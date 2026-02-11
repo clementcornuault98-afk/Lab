@@ -1,0 +1,286 @@
+import streamlit as st
+from snowflake.snowpark.context import get_active_session
+import uuid
+import json
+
+# Obtenir la session Snowflake
+session = get_active_session()
+
+# Configuration de la page
+st.set_page_config(
+    page_title="Chat App avec Snowflake Cortex",
+    page_icon="💬",
+    layout="wide"
+)
+
+# ============================================
+# PARTIE B - INTERFACE PRINCIPALE
+# ============================================
+
+# Titre et description
+st.title("💬 Chat App avec Snowflake Cortex")
+st.markdown("**Discutez avec un assistant IA alimenté par Snowflake Cortex**")
+st.divider()
+
+# ============================================
+# SIDEBAR - CONFIGURATION
+# ============================================
+
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    # Liste des modèles Cortex disponibles
+    modeles_disponibles = [
+        "snowflake-arctic",
+        "mistral-large",
+        "llama3-70b",
+        "llama3-8b",
+        "mistral-7b",
+        "gemma-7b",
+        "reka-flash"
+    ]
+    
+    # Sélecteur de modèle
+    modele_selectionne = st.selectbox(
+        "🤖 Modèle LLM",
+        options=modeles_disponibles,
+        index=0,
+        help="Choisissez le modèle Cortex à utiliser"
+    )
+    
+    # Slider température
+    temperature = st.slider(
+        "🌡️ Température",
+        min_value=0.0,
+        max_value=1.5,
+        value=0.7,
+        step=0.1,
+        help="Contrôle la créativité des réponses (0 = déterministe, 1.5 = très créatif)"
+    )
+    
+    # Option d'affichage
+    afficher_json = st.checkbox(
+        "📋 Afficher JSON complet",
+        value=False,
+        help="Afficher la réponse JSON complète au lieu du texte seul"
+    )
+    
+    st.divider()
+    
+    # Bouton Nouveau Chat
+    if st.button("🔄 Nouveau Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.conversation_id = str(uuid.uuid4())
+        st.rerun()
+    
+    st.divider()
+    
+    # Fonctionnalité optionnelle : Rechargement d'une conversation
+    st.subheader("📂 Charger une conversation")
+    
+    try:
+        conversations = session.sql("""
+            SELECT DISTINCT conversation_id, 
+                   MIN(timestamp) as debut,
+                   COUNT(*) as nb_messages
+            FROM CONVERSATION_HISTORY
+            GROUP BY conversation_id
+            ORDER BY debut DESC
+            LIMIT 20
+        """).collect()
+        
+        if conversations:
+            conv_options = {
+                f"{row['CONVERSATION_ID'][:8]}... ({row['NB_MESSAGES']} msgs)": row['CONVERSATION_ID'] 
+                for row in conversations
+            }
+            
+            conv_selectionnee = st.selectbox(
+                "Choisir une conversation",
+                options=["-- Nouvelle conversation --"] + list(conv_options.keys())
+            )
+            
+            if conv_selectionnee != "-- Nouvelle conversation --":
+                if st.button("📥 Charger", use_container_width=True):
+                    conv_id = conv_options[conv_selectionnee]
+                    
+                    # Charger les messages
+                    messages_db = session.sql(f"""
+                        SELECT role, content
+                        FROM CONVERSATION_HISTORY
+                        WHERE conversation_id = '{conv_id}'
+                        ORDER BY timestamp ASC
+                    """).collect()
+                    
+                    # Restaurer l'état
+                    st.session_state.messages = [
+                        {"role": msg['ROLE'], "content": msg['CONTENT']}
+                        for msg in messages_db
+                        if msg['ROLE'] != 'system'
+                    ]
+                    st.session_state.conversation_id = conv_id
+                    st.success("✅ Conversation chargée !")
+                    st.rerun()
+    except Exception as e:
+        st.caption(f"Aucune conversation sauvegardée")
+    
+    st.divider()
+    
+    # Informations
+    st.caption(f"**Modèle actif :** {modele_selectionne}")
+    st.caption(f"**Température :** {temperature}")
+    if "conversation_id" in st.session_state:
+        st.caption(f"**ID Conversation :** {st.session_state.conversation_id[:8]}...")
+
+# ============================================
+# GESTION DE L'ÉTAT
+# ============================================
+
+# Initialiser l'état de la session
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = str(uuid.uuid4())
+
+# Message système (non affiché dans l'interface)
+MESSAGE_SYSTEM = {
+    "role": "system",
+    "content": "Tu es un assistant utile, serviable et amical. Tu réponds de manière claire et concise en français."
+}
+
+# ============================================
+# PARTIE C - INTÉGRATION SNOWFLAKE CORTEX
+# ============================================
+
+def appeler_cortex(modele, temp):
+    """Appelle Snowflake Cortex et retourne la réponse JSON complète et le texte extrait"""
+    try:
+        # Construire le tableau de messages pour Cortex
+        messages_pour_cortex = [MESSAGE_SYSTEM] + st.session_state.messages
+        
+        # Préparer les messages au format JSON pour la requête SQL
+        messages_json = []
+        for msg in messages_pour_cortex:
+            # Échapper les apostrophes et supprimer les retours à la ligne
+            content_clean = msg['content'].replace("'", "''").replace("\n", " ").replace("\r", " ")
+            messages_json.append(f"{{'role': '{msg['role']}', 'content': '{content_clean}'}}")
+        
+        messages_str = ','.join(messages_json)
+        
+        # Construction de la requête SQL pour Cortex
+        query = f"""
+        SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            '{modele}',
+            [{messages_str}],
+            {{'temperature': {temp}}}
+        ) AS reponse
+        """
+        
+        # Exécuter la requête
+        result = session.sql(query).collect()
+        
+        if result and len(result) > 0:
+            reponse_json = result[0]['REPONSE']
+            
+            # Parser le JSON
+            if isinstance(reponse_json, str):
+                reponse_data = json.loads(reponse_json)
+            else:
+                reponse_data = reponse_json
+            
+            # Extraire le texte de la réponse
+            texte_reponse = ""
+            if 'choices' in reponse_data and len(reponse_data['choices']) > 0:
+                texte_reponse = reponse_data['choices'][0].get('messages', '')
+            
+            return reponse_data, texte_reponse
+        else:
+            return {"error": "Aucune réponse reçue du modèle."}, ""
+            
+    except Exception as e:
+        return {"error": f"Erreur lors de l'appel à Cortex : {str(e)}"}, ""
+
+# ============================================
+# PARTIE D - PERSISTANCE DANS SNOWFLAKE
+# ============================================
+
+def sauvegarder_message(conversation_id, role, content):
+    """Sauvegarde un message dans la table Snowflake"""
+    try:
+        # Échapper les apostrophes pour SQL
+        content_clean = content.replace("'", "''")
+        
+        query = f"""
+        INSERT INTO CONVERSATION_HISTORY (conversation_id, timestamp, role, content)
+        VALUES (
+            '{conversation_id}',
+            CURRENT_TIMESTAMP(),
+            '{role}',
+            '{content_clean}'
+        )
+        """
+        session.sql(query).collect()
+    except Exception as e:
+        st.error(f"Erreur lors de la sauvegarde : {str(e)}")
+
+# ============================================
+# AFFICHAGE DES MESSAGES
+# ============================================
+
+# Conteneur pour l'historique des messages
+chat_container = st.container()
+
+with chat_container:
+    # Afficher tous les messages (sauf system)
+    for message in st.session_state.messages:
+        if message["role"] != "system":
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+# ============================================
+# ZONE DE SAISIE UTILISATEUR
+# ============================================
+
+# Input utilisateur
+if prompt := st.chat_input("Posez votre question..."):
+    
+    # Ajouter le message utilisateur à l'état
+    user_message = {"role": "user", "content": prompt}
+    st.session_state.messages.append(user_message)
+    
+    # Afficher le message utilisateur
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # Sauvegarder le message utilisateur
+    sauvegarder_message(st.session_state.conversation_id, "user", prompt)
+    
+    # Générer et afficher la réponse
+    with st.chat_message("assistant"):
+        with st.spinner("Réflexion en cours..."):
+            # Appeler Cortex et obtenir JSON + texte
+            reponse_json, texte_reponse = appeler_cortex(modele_selectionne, temperature)
+            
+            # Afficher selon le choix de l'utilisateur
+            if afficher_json:
+                st.json(reponse_json)
+            else:
+                st.markdown(texte_reponse)
+    
+    # Ajouter la réponse à l'état (sauvegarder le texte pour l'affichage)
+    assistant_message = {"role": "assistant", "content": texte_reponse}
+    st.session_state.messages.append(assistant_message)
+    
+    # Sauvegarder la réponse (texte)
+    sauvegarder_message(st.session_state.conversation_id, "assistant", texte_reponse)
+    
+    # Recharger pour afficher le nouveau message
+    st.rerun()
+
+# ============================================
+# FOOTER
+# ============================================
+
+st.divider()
+st.caption("💡 Alimenté par Snowflake Cortex | Application développée avec Streamlit in Snowflake")
